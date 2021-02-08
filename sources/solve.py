@@ -1,6 +1,8 @@
 from enum import Enum
 
 from scipy.linalg import qr
+from scipy.sparse import bsr_matrix, csr_matrix, lil_matrix
+from scipy.sparse.linalg import lsqr
 
 from mesh import Mesh, Node, Coordinate
 import numpy as np
@@ -118,7 +120,6 @@ def jacobian_at_coordinate(nodes: [Node], natural_coordinate: NaturalCoordinate)
 
     jacobianS = np.zeros([3])
     jacobianR = np.zeros([3])
-    jacobianT = np.zeros([3])
 
     for node, derivative in zip(nodes, sfd):
         dr = derivative.dr
@@ -222,7 +223,6 @@ class Solver:
     def compute(self):
         # problem size
         num_dofs = len(self.mesh.nodes) * 2
-        stiffness_matrix = np.zeros((num_dofs, num_dofs))
 
         # get the forces (considering only external ones so far)
         force_array = np.zeros(num_dofs)
@@ -234,8 +234,8 @@ class Solver:
                 force_array[eq_number+1] = force.value[1]  # +Y
 
         # get the displacement array with the known values
-        displacements = np.zeros((num_dofs, 1))
-        fixed_nodes = []  # also keep the fixed equations from the matrix
+        displacements = np.zeros(num_dofs)
+        fixed_nodes_eq_numbers = []  # also keep the fixed equations from the matrix
         for constraint in self.constraints:
             nodes = constraint.nodes
             for node in nodes:
@@ -243,10 +243,19 @@ class Solver:
                 displacements[eq_number] = constraint.value[0]
                 displacements[eq_number+1] = constraint.value[1]
                 # for these equations we don't need to solve the system
-                fixed_nodes.extend([eq_number, eq_number + 1])
+                fixed_nodes_eq_numbers.extend([eq_number, eq_number + 1])
 
         # assemble the global stiffness matrix
+        num_computing_dofs = num_dofs - len(fixed_nodes_eq_numbers)
+        stiffness_matrix = lil_matrix((num_computing_dofs, num_computing_dofs))
+        # Issue here; because our stiffness matrix already has equations remove indices don't work
+        # we build a method to retrieve the actual index
+        # map index from range (0, num_dofs) to (0, num_computing_dofs)
+        r = iter(range(0, num_computing_dofs))
+        dof_mapping = [next(r) if i not in fixed_nodes_eq_numbers else -1 for i in range(0, num_dofs)]
+
         for element in self.mesh.elements:
+            print("element {}".format(element.id))
             node_ids = element.nodes
             element_nodes = [self.mesh.nodes[i] for i in node_ids]
 
@@ -259,19 +268,90 @@ class Solver:
 
             for i in range(0, num_element_eq):
                 for j in range(0, num_element_eq):
-                    stiffness_matrix[eq_number[i], eq_number[j]] = \
-                        stiffness_matrix[eq_number[i], eq_number[j]] + Ke[i, j]
+                    # get the equation numbers from the full list of DOFs
+                    eq_idx_x = eq_number[i]
+                    eq_idx_y = eq_number[j]
+                    # skip it if this is constrained
+                    if eq_idx_x in fixed_nodes_eq_numbers or eq_idx_y in fixed_nodes_eq_numbers:
+                        continue
+                    # change the index to the equations to be solved
+                    eq_idx_x = dof_mapping[eq_idx_x]
+                    eq_idx_y = dof_mapping[eq_idx_y]
 
-        reduced_stiffness_matrix = np.delete(stiffness_matrix, fixed_nodes, 0)
-        reduced_stiffness_matrix = np.delete(reduced_stiffness_matrix, fixed_nodes, 1)
+                    stiffness_matrix[eq_idx_x, eq_idx_y] = \
+                        stiffness_matrix[eq_idx_x, eq_idx_y] + Ke[i, j]
 
-        reduced_forces = np.delete(force_array, fixed_nodes, 0)
+        # reduced_stiffness_matrix = np.delete(stiffness_matrix, fixed_nodes_eq_numbers, 0)
+        # reduced_stiffness_matrix = np.delete(reduced_stiffness_matrix, fixed_nodes_eq_numbers, 1)
 
-        print(reduced_stiffness_matrix.shape)
-        print(reduced_forces.shape)
-        u = solve_mldivide(reduced_stiffness_matrix, reduced_forces)
-        print(u)
+        reduced_forces = np.delete(force_array, fixed_nodes_eq_numbers, 0)
 
+        print("Solving the system...")
+        u = lsqr(stiffness_matrix, reduced_forces)[0]
+        # u = solve_mldivide(reduced_stiffness_matrix, reduced_forces)
+        print("Combining results...")
+        j = 0
+        for i in range(0, displacements.shape[0]):
+            if i in fixed_nodes_eq_numbers:
+                continue
+            displacements[i] = u[j]
+            j += 1
+
+        return displacements
+
+    @staticmethod
+    def stress_element_computation(element_nodes: [Node], displacements: np.ndarray):
+        gauss_quadrature = gauss_quadrature_quad_4()
+
+        D = Solver.element_elastic_matrix()
+
+        extrap = np.zeros((4, 4))
+        strsg = np.zeros((3, 4))
+
+        indices = [0, 3, 1, 2]
+        current_index = iter(indices)
+        for gauss_point in gauss_quadrature:
+            idx = next(current_index)
+            sf_derivative_at_gauss_point = shape_function_derivative_quad_4(gauss_point.coordinate)
+            jacobian = jacobian_at_coordinate(element_nodes, gauss_point.coordinate)
+
+            B = Solver.compute_b_matrix(element_nodes, jacobian, sf_derivative_at_gauss_point)
+
+            strsg[:, idx] = np.dot(np.dot(D, B), displacements)
+            shape_functions = shape_function_quad_4(NaturalCoordinate(
+                    1/gauss_point.coordinate.r,
+                    1/gauss_point.coordinate.s, 0))
+
+            extrap[idx, :] = np.array(shape_functions)
+
+        stress = extrap.dot(strsg.transpose()).transpose()
+
+        return stress
+
+    def stress_computation(self, displacements):
+
+        nodal_stress = np.zeros((len(self.mesh.nodes), 3))
+        num_values = np.zeros(len(self.mesh.nodes), dtype=np.uintc)
+
+        for element in self.mesh.elements:
+            node_ids = element.nodes
+            element_nodes = [self.mesh.nodes[i] for i in node_ids]
+            element_displacements = []
+            for i in node_ids:
+                element_displacements.extend([displacements[i*2], displacements[i*2+1]])
+            stresses = self.stress_element_computation(element_nodes, np.array(element_displacements))
+
+            idx = 0
+            for i in node_ids:
+                nodal_stress[i, :] += stresses[:, idx]
+                num_values[i] += 1
+                idx += 1
+
+        for idx in range(0, len(self.mesh.nodes)):
+            if num_values[idx] != 0:
+                nodal_stress[idx, :] /= num_values[idx]
+
+        return nodal_stress
 
 # nodes = [
 #     Node(1, Coordinate(0, 0, 0)),
@@ -288,13 +368,84 @@ test_nodes = [
     Node(3, Coordinate(0, 6, 0)),
 ]
 
-input_mesh = Mesh.create_plate(position=(0, 0),
-                               width=60e-3,
-                               height=20e-3,
-                               num_elements_width=2,
-                               num_elements_height=1)
 
-input_forces = [PointForceLoad([0, 3], [-100, 0])]
-input_constraints = [FixedConstraint([5, 2], [0, 0])]
+def test_case_stress():
+    num_elements_x = 2
+    num_elements_y = 2
+    num_total_nodes = (num_elements_x + 1) * (num_elements_y + 1)
 
-Solver(input_mesh, input_forces, input_constraints).compute()
+    input_mesh = Mesh.create_plate(position=(0, 0),
+                                   width=60e-3,
+                                   height=20e-3,
+                                   num_elements_width=num_elements_x,
+                                   num_elements_height=num_elements_y)
+
+    input_forces_nodes = list(range(0, num_total_nodes, num_elements_x + 1))
+    input_forces = [PointForceLoad(
+        [input_forces_nodes[3], input_forces_nodes[-1]],
+        [-100, 0])]
+
+    input_constraints_nodes = list(range(num_elements_x, num_total_nodes, num_elements_x + 1))
+    input_constraints = [FixedConstraint(
+        input_constraints_nodes,
+        [0, 0])]
+
+    print("Computing...")
+    solver = Solver(input_mesh, input_forces, input_constraints)
+    u_x_y = solver.stress_element_computation(test_nodes, np.array([1, 2, 3, 4, 5, 6, 7, 8]))
+
+
+def test_case():
+    compute_stress = True
+
+    num_elements_x = 50
+    num_elements_y = 50
+    num_total_nodes = (num_elements_x + 1) * (num_elements_y + 1)
+
+    input_mesh = Mesh.create_plate(position=(0, 0),
+                                   width=60,
+                                   height=20,
+                                   num_elements_width=num_elements_x,
+                                   num_elements_height=num_elements_y)
+
+    input_forces_nodes = list(range(0, num_total_nodes, num_elements_x + 1))
+    input_forces = [PointForceLoad(
+        input_forces_nodes,
+        [-1000, 0])]
+
+    input_constraints_nodes = list(range(num_elements_x, num_total_nodes, num_elements_x + 1))
+    input_constraints = [FixedConstraint(
+        input_constraints_nodes,
+        [0, 0])]
+
+    print("Computing...")
+    solver = Solver(input_mesh, input_forces, input_constraints)
+    u_x_y = solver.compute()
+
+    print("Writing Results...")
+    with open('displacement_x.txt', 'w') as mesh_file:
+        for node, u in zip(input_mesh.nodes, u_x_y[0::2]):
+            mesh_file.write("{} {} {}\n".format(node.coordinate.x, node.coordinate.y, u))
+
+    with open('displacement_y.txt', 'w') as mesh_file:
+        for node, u in zip(input_mesh.nodes, u_x_y[1::2]):
+            mesh_file.write("{} {} {}\n".format(node.coordinate.x, node.coordinate.y, u))
+
+    if compute_stress:
+        stress = solver.stress_computation(u_x_y)
+
+        print("Writing Stress...")
+        with open('stress_x.txt', 'w') as mesh_file:
+            for node, u in zip(input_mesh.nodes, stress):
+                mesh_file.write("{} {} {}\n".format(node.coordinate.x, node.coordinate.y, u[0]))
+
+        with open('stress_y.txt', 'w') as mesh_file:
+            for node, u in zip(input_mesh.nodes, stress):
+                mesh_file.write("{} {} {}\n".format(node.coordinate.x, node.coordinate.y, u[1]))
+                
+        with open('stress_xy.txt', 'w') as mesh_file:
+            for node, u in zip(input_mesh.nodes, stress):
+                mesh_file.write("{} {} {}\n".format(node.coordinate.x, node.coordinate.y, u[2]))
+
+
+test_case()

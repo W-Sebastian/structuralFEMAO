@@ -78,6 +78,7 @@ class Mesh:
                                                   node_index(i, j),
                                                   node_index(i - 1, j)],
                                                  ElementTopology.Quad4))
+                    element_id += 1
 
         return mesh
 
